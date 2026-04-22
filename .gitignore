@@ -1,0 +1,27 @@
+# Built output
+build/
+app/build/
+
+# Gradle
+.gradle/
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# Kotlin
+.kotlin/
+
+# Android
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Heap dumps
+*.hprof
+
+# OS
+.DS_Store
+Thumbs.db
