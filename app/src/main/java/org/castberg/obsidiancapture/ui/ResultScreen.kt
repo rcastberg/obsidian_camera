@@ -1,5 +1,6 @@
 package org.castberg.obsidiancapture.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -21,6 +22,8 @@ fun CaptureDetailScreen(
     record: CaptureRecord,
     onClose: () -> Unit
 ) {
+    BackHandler { onClose() }
+
     val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
     val dateTime = Instant.ofEpochMilli(record.timestamp)
         .atZone(ZoneId.systemDefault())

@@ -25,11 +25,13 @@ val PROVIDERS = listOf(
         models = listOf(
             ModelOption("openai/gpt-4o",                              "GPT-4o (OpenAI)"),
             ModelOption("openai/gpt-4.1",                             "GPT-4.1 (OpenAI)"),
+            ModelOption("openai/gpt-4.1-mini",                        "GPT-4.1 mini (OpenAI)"),
             ModelOption("anthropic/claude-opus-4-7",                  "Claude Opus 4.7"),
             ModelOption("anthropic/claude-sonnet-4-6",                "Claude Sonnet 4.6"),
             ModelOption("anthropic/claude-haiku-4-5",                 "Claude Haiku 4.5"),
             ModelOption("google/gemini-2.5-pro",                      "Gemini 2.5 Pro"),
             ModelOption("google/gemini-2.0-flash",                    "Gemini 2.0 Flash"),
+            ModelOption("google/gemma-4-27b-it",                      "Gemma 4 27B"),
             ModelOption("meta-llama/llama-3.2-90b-vision-instruct",   "Llama 3.2 90B Vision"),
         )
     ),
@@ -41,6 +43,7 @@ val PROVIDERS = listOf(
             ModelOption("gemini-2.0-flash", "Gemini 2.0 Flash"),
             ModelOption("gemini-1.5-pro",   "Gemini 1.5 Pro"),
             ModelOption("gemini-1.5-flash", "Gemini 1.5 Flash"),
+            ModelOption("gemma-4-27b-it",   "Gemma 4 27B"),
         )
     ),
     ProviderConfig(
