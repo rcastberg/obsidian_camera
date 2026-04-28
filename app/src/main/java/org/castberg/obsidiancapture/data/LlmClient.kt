@@ -11,6 +11,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+data class OcrResult(
+    val markdown: String,
+    val extractedImages: List<Pair<String, ByteArray>>  // image-id -> bytes
+)
+
 object LlmClient {
 
     private val client = OkHttpClient.Builder()
@@ -38,19 +43,31 @@ object LlmClient {
         "- Add 2-3 relevant #tags at the bottom\n" +
         "Return only the markdown content — no preamble, no code fences."
 
+    const val DEFAULT_TRANSCRIBE_PROMPT =
+        "You are transcribing a document for an Obsidian personal knowledge base. " +
+        "Transcribe all visible text exactly as it appears. Use markdown formatting:\n" +
+        "- Use # headings to match the document's structure\n" +
+        "- Preserve lists, tables, and other formatting faithfully\n" +
+        "- Use [[wikilinks]] for names, places, and key concepts\n" +
+        "- Add a #tags section at the bottom\n" +
+        "Return only the markdown content — no JSON, no preamble, no code fences."
+
     private const val FILENAME_PROMPT =
         "Generate a short filename for the following note. " +
         "Rules: lowercase kebab-case, max 50 characters, only letters/numbers/hyphens, no extension. " +
         "Respond with ONLY the filename — no explanation, no punctuation, nothing else."
 
+    // ── Analysis ──────────────────────────────────────────────────────────────
+
     suspend fun analyzeImage(
-        settings: AppSettings,
+        baseUrl: String,
+        apiKey: String,
         imageBytes: ByteArray,
         model: String,
-        systemPrompt: String
+        systemPrompt: String,
+        maxTokens: Int
     ): String {
         val base64 = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
-
         val body = JSONObject().apply {
             put("model", model.ifBlank { "gpt-4o" })
             put("messages", JSONArray().apply {
@@ -72,17 +89,18 @@ object LlmClient {
                     })
                 })
             })
-            put("max_tokens", 2000)
+            put("max_tokens", maxTokens)
         }.toString()
-
-        return callApi(settings, body)
+        return callApi(baseUrl, apiKey, body)
     }
 
     suspend fun analyzeImages(
-        settings: AppSettings,
+        baseUrl: String,
+        apiKey: String,
         imageBytesList: List<ByteArray>,
         model: String,
-        systemPrompt: String
+        systemPrompt: String,
+        maxTokens: Int
     ): String {
         val content = JSONArray().apply {
             imageBytesList.forEach { bytes ->
@@ -97,7 +115,6 @@ object LlmClient {
                 put("text", "Analyze these ${imageBytesList.size} images.")
             })
         }
-
         val body = JSONObject().apply {
             put("model", model.ifBlank { "gpt-4o" })
             put("messages", JSONArray().apply {
@@ -110,15 +127,77 @@ object LlmClient {
                     put("content", content)
                 })
             })
-            put("max_tokens", 2000)
+            put("max_tokens", maxTokens)
         }.toString()
-
-        return callApi(settings, body)
+        return callApi(baseUrl, apiKey, body)
     }
 
-    suspend fun generateFilename(settings: AppSettings, markdown: String): String {
+    // ── Mistral OCR ───────────────────────────────────────────────────────────
+
+    suspend fun ocrImage(
+        baseUrl: String,
+        apiKey: String,
+        imageBytes: ByteArray
+    ): OcrResult = withContext(Dispatchers.IO) {
+        val base64 = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
+        val url = "${baseUrl.trimEnd('/')}/ocr"
+
+        val requestBody = JSONObject().apply {
+            put("model", "mistral-ocr-latest")
+            put("document", JSONObject().apply {
+                put("type", "image_url")
+                put("image_url", "data:image/jpeg;base64,$base64")
+            })
+            put("include_image_base64", true)
+        }.toString()
+
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $apiKey")
+            .post(requestBody.toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val responseBody = client.newCall(request).execute().use { response ->
+            val rb = response.body?.string() ?: throw Exception("Empty OCR response")
+            if (!response.isSuccessful) throw Exception("OCR error ${response.code}: $rb")
+            rb
+        }
+
+        val json = JSONObject(responseBody)
+        val pages = json.getJSONArray("pages")
+        val markdownParts = mutableListOf<String>()
+        val extractedImages = mutableListOf<Pair<String, ByteArray>>()
+
+        for (i in 0 until pages.length()) {
+            val page = pages.getJSONObject(i)
+            markdownParts.add(page.optString("markdown", ""))
+            val images = page.optJSONArray("images") ?: continue
+            for (j in 0 until images.length()) {
+                val img = images.getJSONObject(j)
+                val id  = img.optString("id", "img-$i-$j")
+                val b64 = img.optString("image_base64", "")
+                if (b64.isNotBlank()) {
+                    extractedImages.add(Pair(id, Base64.decode(b64, Base64.DEFAULT)))
+                }
+            }
+        }
+
+        OcrResult(
+            markdown        = markdownParts.joinToString("\n\n"),
+            extractedImages = extractedImages
+        )
+    }
+
+    // ── Filename ──────────────────────────────────────────────────────────────
+
+    suspend fun generateFilename(
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        markdown: String
+    ): String {
         val body = JSONObject().apply {
-            put("model", settings.lowEffortModel.ifBlank { "gpt-4o-mini" })
+            put("model", model.ifBlank { "gpt-4o-mini" })
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
                     put("role", "system")
@@ -131,75 +210,51 @@ object LlmClient {
             })
             put("max_tokens", 30)
         }.toString()
-
-        return sanitizeFilename(callApi(settings, body))
+        return sanitizeFilename(callApi(baseUrl, apiKey, body))
     }
 
-    private suspend fun callApi(settings: AppSettings, requestBody: String): String = withContext(Dispatchers.IO) {
-        val baseUrl = settings.llmUrl.trimEnd('/')
-        val url = if (baseUrl.endsWith("/chat/completions")) baseUrl else "$baseUrl/chat/completions"
+    // ── Model discovery ───────────────────────────────────────────────────────
 
+    suspend fun fetchModels(
+        baseUrl: String,
+        apiKey: String,
+        providerName: String
+    ): List<ModelOption> = withContext(Dispatchers.IO) {
+        val url = "${baseUrl.trimEnd('/')}/models"
         val request = Request.Builder()
             .url(url)
-            .addHeader("Authorization", "Bearer ${settings.apiKey}")
+            .addHeader("Authorization", "Bearer $apiKey")
             .apply {
                 if (url.contains("openrouter.ai")) {
                     addHeader("HTTP-Referer", "https://github.com/castberg/obsidian-capture")
                     addHeader("X-Title", "Obsidian Capture")
                 }
             }
-            .post(requestBody.toRequestBody("application/json".toMediaType()))
+            .get()
             .build()
 
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: throw Exception("Empty response from API")
-
-        if (!response.isSuccessful) throw Exception("API error ${response.code}: $body")
-
-        JSONObject(body)
-            .getJSONArray("choices")
-            .getJSONObject(0)
-            .getJSONObject("message")
-            .getString("content")
-            .trim()
-    }
-
-    suspend fun fetchModels(baseUrl: String, apiKey: String, providerName: String): List<ModelOption> =
-        withContext(Dispatchers.IO) {
-            val url = "${baseUrl.trimEnd('/')}/models"
-            val request = Request.Builder()
-                .url(url)
-                .addHeader("Authorization", "Bearer $apiKey")
-                .apply {
-                    if (url.contains("openrouter.ai")) {
-                        addHeader("HTTP-Referer", "https://github.com/castberg/obsidian-capture")
-                        addHeader("X-Title", "Obsidian Capture")
-                    }
-                }
-                .get()
-                .build()
-
-            val body = client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw Exception("HTTP ${response.code}")
-                response.body?.string() ?: throw Exception("Empty response")
-            }
-
-            val data = JSONObject(body).getJSONArray("data")
-            when (providerName) {
-                "OpenRouter" -> parseOpenRouterModels(data)
-                "OpenAI"     -> parseOpenAiModels(data)
-                "Google"     -> parseGoogleModels(data)
-                else         -> emptyList()
-            }
+        val body = client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw Exception("HTTP ${response.code}")
+            response.body?.string() ?: throw Exception("Empty response")
         }
+
+        val data = JSONObject(body).getJSONArray("data")
+        when (providerName) {
+            "OpenRouter" -> parseOpenRouterModels(data)
+            "OpenAI"     -> parseOpenAiModels(data)
+            "Google"     -> parseGoogleModels(data)
+            "Mistral"    -> parseMistralModels(data)
+            else         -> emptyList()
+        }
+    }
 
     private fun parseOpenRouterModels(data: JSONArray): List<ModelOption> {
         val models = mutableListOf<ModelOption>()
         for (i in 0 until data.length()) {
             val obj = data.getJSONObject(i)
             val pricing = obj.optJSONObject("pricing")
-            val promptPrice  = pricing?.optString("prompt",     "1") ?: "1"
-            val completionPrice = pricing?.optString("completion", "1") ?: "1"
+            val promptPrice      = pricing?.optString("prompt",     "1") ?: "1"
+            val completionPrice  = pricing?.optString("completion", "1") ?: "1"
             if (promptPrice.toDoubleOrNull() == 0.0 && completionPrice.toDoubleOrNull() == 0.0) continue
             val id   = obj.optString("id").ifBlank { continue }
             val name = obj.optString("name", id).ifBlank { id }
@@ -226,6 +281,46 @@ object LlmClient {
                 if (id.isBlank()) null else ModelOption(id, id)
             }
             .sortedBy { it.id }
+
+    private fun parseMistralModels(data: JSONArray): List<ModelOption> =
+        (0 until data.length())
+            .mapNotNull { i ->
+                val id = data.getJSONObject(i).optString("id")
+                if (id.isBlank()) null else ModelOption(id, id)
+            }
+            .sortedBy { it.id }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    private suspend fun callApi(baseUrl: String, apiKey: String, requestBody: String): String =
+        withContext(Dispatchers.IO) {
+            val trimmed = baseUrl.trimEnd('/')
+            val url = if (trimmed.endsWith("/chat/completions")) trimmed
+                      else "$trimmed/chat/completions"
+
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "Bearer $apiKey")
+                .apply {
+                    if (url.contains("openrouter.ai")) {
+                        addHeader("HTTP-Referer", "https://github.com/castberg/obsidian-capture")
+                        addHeader("X-Title", "Obsidian Capture")
+                    }
+                }
+                .post(requestBody.toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val response = client.newCall(request).execute()
+            val body = response.body?.string() ?: throw Exception("Empty response from API")
+            if (!response.isSuccessful) throw Exception("API error ${response.code}: $body")
+
+            JSONObject(body)
+                .getJSONArray("choices")
+                .getJSONObject(0)
+                .getJSONObject("message")
+                .getString("content")
+                .trim()
+        }
 
     private fun sanitizeFilename(name: String): String =
         name.trim()

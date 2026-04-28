@@ -15,26 +15,33 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlinx.coroutines.launch
 import org.castberg.obsidiancapture.data.CaptureRecord
 import java.io.File
 
@@ -60,22 +67,21 @@ private fun detectLenses(context: Context): List<LensInfo> {
                 val chars = manager.getCameraCharacteristics(id)
                 val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: return@mapNotNull null
                 val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                if (facing == CameraCharacteristics.LENS_FACING_BACK && focalLengths != null && focalLengths.isNotEmpty()) {
-                    Pair(id, focalLengths.min())
-                } else null
+                if (facing == CameraCharacteristics.LENS_FACING_BACK
+                    && focalLengths != null && focalLengths.isNotEmpty()
+                ) Pair(id, focalLengths.min()) else null
             }.getOrNull()
         }.sortedBy { it.second }
 
         val minFocal = raw.minOfOrNull { it.second } ?: return@runCatching emptyList()
         raw.mapIndexed { idx, (id, focal) ->
-            val zoomFactor = focal / minFocal
             val label = when {
                 raw.size == 1 -> "Main"
-                idx == 0 -> "Wide"
+                idx == 0      -> "Wide"
                 idx == raw.size - 1 -> "Tele"
-                else -> "Main"
+                else          -> "Main"
             }
-            LensInfo(id, focal, zoomFactor, label)
+            LensInfo(id, focal, focal / minFocal, label)
         }
     }.getOrDefault(emptyList())
 }
@@ -83,25 +89,29 @@ private fun detectLenses(context: Context): List<LensInfo> {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CameraScreen(
-    imageQuality: Int,
     outputFolderUri: String,
+    imageQuality: Int,
     history: List<CaptureRecord>,
-    useHighEffort: Boolean,
+    tabNames: List<String>,
+    activeTabIndex: Int,
     isMultiMode: Boolean,
     pendingImageCount: Int,
+    backgroundJobCount: Int,
     onImageCaptured: (ByteArray) -> Unit,
     onNavigateToSettings: () -> Unit,
     onViewCapture: (CaptureRecord) -> Unit,
-    onToggleEffort: () -> Unit,
+    onSetActiveTab: (Int) -> Unit,
     onToggleMultiMode: () -> Unit,
     onSendMultiImages: () -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
 
     var hasCameraPermission by remember {
         mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED
         )
     }
     var captureError by remember { mutableStateOf<String?>(null) }
@@ -112,9 +122,9 @@ fun CameraScreen(
     var minZoomRatio by remember { mutableStateOf(1f) }
     var maxZoomRatio by remember { mutableStateOf(1f) }
     var selectedLensIndex by remember { mutableStateOf(0) }
+    var lensMenuExpanded by remember { mutableStateOf(false) }
 
     val availableLenses = remember { detectLenses(context) }
-
     var flashMode by remember { mutableStateOf(ImageCapture.FLASH_MODE_OFF) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -124,9 +134,9 @@ fun CameraScreen(
     LaunchedEffect(Unit) {
         val needed = buildList {
             if (!hasCameraPermission) add(Manifest.permission.CAMERA)
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED
+            ) add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
         if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
     }
@@ -134,7 +144,10 @@ fun CameraScreen(
     val imageCapture = remember(imageQuality) {
         ImageCapture.Builder().setJpegQuality(imageQuality).build()
     }
-    LaunchedEffect(flashMode, imageCapture) { imageCapture.flashMode = flashMode }
+    LaunchedEffect(flashMode, imageCapture, camera) {
+        imageCapture.flashMode = flashMode
+        camera?.cameraControl?.enableTorch(flashMode == ImageCapture.FLASH_MODE_ON)
+    }
     val previewView = remember { PreviewView(context) }
 
     LaunchedEffect(hasCameraPermission, selectedLensIndex) {
@@ -164,44 +177,106 @@ fun CameraScreen(
         }, ContextCompat.getMainExecutor(context))
     }
 
+    val pageCount = tabNames.size.coerceAtLeast(1)
+    val pagerState = rememberPagerState(
+        initialPage = activeTabIndex.coerceIn(0, pageCount - 1)
+    ) { pageCount }
+
+    LaunchedEffect(activeTabIndex) {
+        val target = activeTabIndex.coerceIn(0, pageCount - 1)
+        if (pagerState.currentPage != target) pagerState.animateScrollToPage(target)
+    }
+    LaunchedEffect(pagerState.currentPage) {
+        if (pagerState.currentPage != activeTabIndex) onSetActiveTab(pagerState.currentPage)
+    }
+
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Obsidian Capture") },
-                actions = {
-                    IconButton(onClick = {
-                        flashMode = when (flashMode) {
-                            ImageCapture.FLASH_MODE_OFF  -> ImageCapture.FLASH_MODE_AUTO
-                            ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
-                            else                         -> ImageCapture.FLASH_MODE_OFF
-                        }
-                    }) {
-                        Icon(
-                            when (flashMode) {
-                                ImageCapture.FLASH_MODE_ON   -> Icons.Default.FlashOn
-                                ImageCapture.FLASH_MODE_AUTO -> Icons.Default.FlashAuto
-                                else                         -> Icons.Default.FlashOff
-                            },
-                            contentDescription = "Flash mode"
-                        )
-                    }
-                    IconButton(onClick = { showHistory = true }) {
-                        BadgedBox(
-                            badge = {
-                                if (history.isNotEmpty()) Badge { Text("${history.size}") }
+            Column {
+                TopAppBar(
+                    title = { Text("Obsidian Capture") },
+                    actions = {
+                        IconButton(onClick = {
+                            flashMode = when (flashMode) {
+                                ImageCapture.FLASH_MODE_OFF  -> ImageCapture.FLASH_MODE_AUTO
+                                ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
+                                else                         -> ImageCapture.FLASH_MODE_OFF
                             }
-                        ) {
-                            Icon(Icons.Default.History, contentDescription = "History")
+                        }) {
+                            Icon(
+                                when (flashMode) {
+                                    ImageCapture.FLASH_MODE_ON   -> Icons.Default.FlashOn
+                                    ImageCapture.FLASH_MODE_AUTO -> Icons.Default.FlashAuto
+                                    else                         -> Icons.Default.FlashOff
+                                },
+                                contentDescription = "Flash mode"
+                            )
+                        }
+                        BadgedBox(badge = {
+                            if (backgroundJobCount > 0) Badge { Text("$backgroundJobCount") }
+                        }) {
+                            IconButton(onClick = { showHistory = true }) {
+                                Icon(Icons.Default.History, contentDescription = "History")
+                            }
+                        }
+                        IconButton(onClick = onNavigateToSettings) {
+                            Icon(Icons.Default.Settings, contentDescription = "Settings")
                         }
                     }
-                    IconButton(onClick = onNavigateToSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+                )
+                // Custom filled tab row — selected tab has filled primary background
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    tabNames.forEachIndexed { index, name ->
+                        val selected = pagerState.currentPage == index
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .background(
+                                    if (selected) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.surface
+                                )
+                                .clickable { coroutineScope.launch { pagerState.animateScrollToPage(index) } }
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                name,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = if (selected) MaterialTheme.colorScheme.onPrimary
+                                        else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
-            )
+            }
         }
     ) { padding ->
-        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .pointerInput(camera) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.changes.size >= 2) {
+                                val c0 = event.changes[0]
+                                val c1 = event.changes[1]
+                                val prevDist = (c0.previousPosition - c1.previousPosition).getDistance()
+                                val currDist = (c0.position - c1.position).getDistance()
+                                if (prevDist > 0f) {
+                                    val zoom = currDist / prevDist
+                                    val newZoom = (currentZoomRatio * zoom)
+                                        .coerceIn(minZoomRatio, maxZoomRatio)
+                                    currentZoomRatio = newZoom
+                                    camera?.cameraControl?.setZoomRatio(newZoom)
+                                }
+                                event.changes.forEach { it.consume() }
+                            }
+                        }
+                    }
+                }
+        ) {
             if (!hasCameraPermission) {
                 Column(
                     modifier = Modifier.align(Alignment.Center).padding(32.dp),
@@ -214,66 +289,44 @@ fun CameraScreen(
                     }
                 }
             } else {
-                AndroidView(
-                    factory = { previewView },
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(camera) {
-                            detectTransformGestures { _, _, zoom, _ ->
-                                val newZoom = (currentZoomRatio * zoom).coerceIn(minZoomRatio, maxZoomRatio)
-                                currentZoomRatio = newZoom
-                                camera?.cameraControl?.setZoomRatio(newZoom)
-                            }
-                        }
-                )
+                AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
 
+                HorizontalPager(
+                    state    = pagerState,
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Box(Modifier.fillMaxSize())
+                }
+
+                // Warning overlays
                 Column(modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter)) {
                     if (outputFolderUri.isBlank()) {
                         Card(
                             modifier = Modifier.fillMaxWidth().padding(12.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                            colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
                         ) {
                             Text(
                                 "Output folder not set — tap Settings to configure",
                                 modifier = Modifier.padding(12.dp),
-                                color = MaterialTheme.colorScheme.onErrorContainer
+                                color    = MaterialTheme.colorScheme.onErrorContainer
                             )
                         }
                     }
                     captureError?.let { msg ->
                         Card(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                            colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
                         ) {
                             Text(msg, modifier = Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onErrorContainer)
                         }
                     }
                 }
 
+                // Bottom controls
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.BottomCenter),
+                    modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    if (availableLenses.size > 1) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.padding(bottom = 8.dp)
-                        ) {
-                            availableLenses.forEachIndexed { index, lens ->
-                                FilterChip(
-                                    selected = selectedLensIndex == index,
-                                    onClick = {
-                                        selectedLensIndex = index
-                                        currentZoomRatio = 1f
-                                    },
-                                    label = { Text("%.1fx".format(lens.zoomFactor)) }
-                                )
-                            }
-                        }
-                    }
-
                     if (isMultiMode && pendingImageCount > 0) {
                         Row(
                             modifier = Modifier
@@ -287,9 +340,7 @@ fun CameraScreen(
                                 color = Color.White,
                                 style = MaterialTheme.typography.bodyMedium
                             )
-                            Button(onClick = onSendMultiImages) {
-                                Text("Send")
-                            }
+                            Button(onClick = onSendMultiImages) { Text("Send") }
                         }
                     }
 
@@ -298,21 +349,67 @@ fun CameraScreen(
                             .fillMaxWidth()
                             .padding(bottom = 32.dp)
                     ) {
-                        if (maxZoomRatio > minZoomRatio) {
-                            Text(
-                                "%.1fx".format(currentZoomRatio),
-                                modifier = Modifier
-                                    .align(Alignment.CenterStart)
-                                    .padding(start = 32.dp),
-                                color = Color.White,
-                                style = MaterialTheme.typography.titleMedium
-                            )
+                        // Left: zoom ratio + lens dropdown
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .padding(start = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (maxZoomRatio > minZoomRatio) {
+                                Text(
+                                    "%.1fx".format(currentZoomRatio),
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                            }
+                            if (availableLenses.size > 1) {
+                                val currentLens = availableLenses.getOrNull(selectedLensIndex)
+                                Box {
+                                    OutlinedButton(
+                                        onClick = { lensMenuExpanded = true },
+                                        modifier = Modifier.height(36.dp),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                                    ) {
+                                        Text(
+                                            "${currentLens?.label ?: "Main"} · %.1fx".format(currentLens?.zoomFactor ?: 1f),
+                                            style = MaterialTheme.typography.labelMedium
+                                        )
+                                        Icon(
+                                            Icons.Default.ArrowDropDown,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    DropdownMenu(
+                                        expanded = lensMenuExpanded,
+                                        onDismissRequest = { lensMenuExpanded = false }
+                                    ) {
+                                        availableLenses.forEachIndexed { index, lens ->
+                                            DropdownMenuItem(
+                                                text = { Text("${lens.label} · %.1fx".format(lens.zoomFactor)) },
+                                                onClick = {
+                                                    selectedLensIndex = index
+                                                    currentZoomRatio = 1f
+                                                    lensMenuExpanded = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
 
+                        // Centre: capture FAB
                         FloatingActionButton(
                             onClick = {
                                 captureError = null
-                                if (outputFolderUri.isBlank()) { onNavigateToSettings(); return@FloatingActionButton }
+                                if (outputFolderUri.isBlank()) {
+                                    onNavigateToSettings()
+                                    return@FloatingActionButton
+                                }
                                 runCatching {
                                     val tempFile = File.createTempFile("cap", ".jpg", context.cacheDir)
                                     val opts = ImageCapture.OutputFileOptions.Builder(tempFile).build()
@@ -338,34 +435,23 @@ fun CameraScreen(
                             Icon(Icons.Default.CameraAlt, contentDescription = "Capture")
                         }
 
-                        Column(
+                        // Right: multi-image toggle
+                        BadgedBox(
+                            badge = {
+                                if (isMultiMode && pendingImageCount > 0)
+                                    Badge { Text("$pendingImageCount") }
+                            },
                             modifier = Modifier
                                 .align(Alignment.CenterEnd)
-                                .padding(end = 12.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                                .padding(end = 16.dp)
                         ) {
-                            Text(
-                                "EFFORT",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color.White
-                            )
-                            FilterChip(
-                                selected = useHighEffort,
-                                onClick = { if (!useHighEffort) onToggleEffort() },
-                                label = { Text("High") }
-                            )
-                            FilterChip(
-                                selected = !useHighEffort,
-                                onClick = { if (useHighEffort) onToggleEffort() },
-                                label = { Text("Med") }
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            FilterChip(
-                                selected = isMultiMode,
-                                onClick = onToggleMultiMode,
-                                label = { Text("Multi") }
-                            )
+                            IconButton(onClick = onToggleMultiMode) {
+                                Icon(
+                                    Icons.Default.PhotoLibrary,
+                                    contentDescription = "Multi-image mode",
+                                    tint = if (isMultiMode) MaterialTheme.colorScheme.primary else Color.White
+                                )
+                            }
                         }
                     }
                 }
@@ -375,11 +461,8 @@ fun CameraScreen(
 
     if (showHistory) {
         HistorySheet(
-            records = history,
-            onSelect = { record ->
-                showHistory = false
-                onViewCapture(record)
-            },
+            records   = history,
+            onSelect  = { record -> showHistory = false; onViewCapture(record) },
             onDismiss = { showHistory = false }
         )
     }

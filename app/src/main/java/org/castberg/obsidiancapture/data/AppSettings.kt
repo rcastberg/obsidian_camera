@@ -1,15 +1,32 @@
 package org.castberg.obsidiancapture.data
 
+data class ProviderCredential(
+    val providerName: String,
+    val apiKey: String,
+    val customUrl: String = ""
+)
+
+data class TabConfig(
+    val id: String,
+    val name: String,
+    val providerName: String,
+    val model: String,
+    val systemPrompt: String,
+    val maxTokens: Int
+)
+
+val DEFAULT_TABS = listOf(
+    TabConfig("capture",    "Capture",    "OpenAI",  "gpt-4o-mini",        "", 2000),
+    TabConfig("detail",     "Detail",     "OpenAI",  "gpt-4o",             "", 4000),
+    TabConfig("transcribe", "Transcribe", "Mistral", "mistral-ocr-latest", "", 4000),
+)
+
 data class AppSettings(
-    val providerName: String = "OpenAI",
-    val llmUrl: String = "https://api.openai.com/v1",
-    val apiKey: String = "",
-    val defaultHighEffort: Boolean = true,
-    val highEffortModel: String = "gpt-4o",
-    val mediumEffortModel: String = "gpt-4o-mini",
-    val lowEffortModel: String = "gpt-4o-mini",
-    val systemPrompt: String = "",
-    val mediumSystemPrompt: String = "",
+    val providerCredentials: List<ProviderCredential> = emptyList(),
+    val tabs: List<TabConfig> = DEFAULT_TABS,
+    val filenameProviderName: String = "",
+    val filenameModel: String = "gpt-4o-mini",
+    val defaultTab: Int = 0,
     val outputFolderUri: String = "",
     val imageQuality: Int = 85
 )

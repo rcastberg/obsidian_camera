@@ -34,8 +34,8 @@ class MainActivity : ComponentActivity() {
         setContent {
             ObsidianCaptureTheme {
                 val settings by viewModel.settings.collectAsState()
-                val history by viewModel.history.collectAsState()
-                val context = LocalContext.current
+                val history  by viewModel.history.collectAsState()
+                val context  = LocalContext.current
 
                 LaunchedEffect(Unit) {
                     viewModel.finishEvent.collect { finish() }
@@ -50,33 +50,37 @@ class MainActivity : ComponentActivity() {
 
                 when (val screen = viewModel.screen) {
                     is MainViewModel.Screen.Camera -> CameraScreen(
-                        imageQuality = settings.imageQuality,
-                        outputFolderUri = settings.outputFolderUri,
-                        history = history,
-                        useHighEffort = viewModel.useHighEffort,
-                        isMultiMode = viewModel.isMultiMode,
-                        pendingImageCount = viewModel.pendingImageCount,
-                        onImageCaptured = viewModel::onImageCaptured,
+                        outputFolderUri      = settings.outputFolderUri,
+                        imageQuality         = settings.imageQuality,
+                        history              = history,
+                        tabNames             = settings.tabs.map { it.name },
+                        activeTabIndex       = viewModel.activeTabIndex,
+                        isMultiMode          = viewModel.isMultiMode,
+                        pendingImageCount    = viewModel.pendingImageCount,
+                        backgroundJobCount   = viewModel.backgroundJobCount,
+                        onImageCaptured      = viewModel::onImageCaptured,
                         onNavigateToSettings = viewModel::navigateToSettings,
-                        onViewCapture = viewModel::viewCapture,
-                        onToggleEffort = viewModel::toggleEffort,
-                        onToggleMultiMode = viewModel::toggleMultiMode,
-                        onSendMultiImages = viewModel::onSendMultiImages
+                        onViewCapture        = viewModel::viewCapture,
+                        onSetActiveTab       = viewModel::onTabSelected,
+                        onToggleMultiMode    = viewModel::toggleMultiMode,
+                        onSendMultiImages    = viewModel::onSendMultiImages
                     )
                     is MainViewModel.Screen.Settings -> SettingsScreen(
-                        settings = settings,
-                        onSave = viewModel::saveSettings,
+                        settings       = settings,
+                        onSave         = viewModel::saveSettings,
                         onNavigateBack = viewModel::navigateToCamera
                     )
                     is MainViewModel.Screen.Processing -> ProcessingScreen(step = screen.step)
                     is MainViewModel.Screen.ViewCapture -> CaptureDetailScreen(
-                        record = screen.record,
-                        onClose = viewModel::navigateToCamera
+                        record     = screen.record,
+                        tabNames   = settings.tabs.map { it.name },
+                        onResubmit = { tabIndex -> viewModel.resubmit(screen.record, tabIndex) },
+                        onClose    = viewModel::navigateToCamera
                     )
                     is MainViewModel.Screen.Error -> ErrorScreen(
-                        message = screen.message,
+                        message  = screen.message,
                         canRetry = screen.imageBytes != null,
-                        onRetry = viewModel::retry,
+                        onRetry  = viewModel::retry,
                         onRetake = viewModel::retake
                     )
                 }

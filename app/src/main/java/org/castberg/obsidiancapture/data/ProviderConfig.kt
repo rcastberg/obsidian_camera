@@ -47,6 +47,15 @@ val PROVIDERS = listOf(
         )
     ),
     ProviderConfig(
+        name = "Mistral",
+        baseUrl = "https://api.mistral.ai/v1",
+        models = listOf(
+            ModelOption("mistral-ocr-latest",   "Mistral OCR"),
+            ModelOption("pixtral-large-latest", "Pixtral Large"),
+            ModelOption("pixtral-12b-2409",     "Pixtral 12B"),
+        )
+    ),
+    ProviderConfig(
         name = "Custom",
         baseUrl = "",
         models = emptyList()
@@ -55,3 +64,5 @@ val PROVIDERS = listOf(
 
 fun providerByName(name: String): ProviderConfig =
     PROVIDERS.find { it.name == name } ?: PROVIDERS.last()
+
+fun isMistralOcr(model: String): Boolean = model == "mistral-ocr-latest"

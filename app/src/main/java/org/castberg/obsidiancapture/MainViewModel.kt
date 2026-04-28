@@ -32,8 +32,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.castberg.obsidiancapture.data.AppSettings
 import org.castberg.obsidiancapture.data.CaptureRecord
+import org.castberg.obsidiancapture.data.DEFAULT_TABS
 import org.castberg.obsidiancapture.data.LlmClient
+import org.castberg.obsidiancapture.data.ProviderCredential
 import org.castberg.obsidiancapture.data.SettingsRepository
+import org.castberg.obsidiancapture.data.TabConfig
+import org.castberg.obsidiancapture.data.isMistralOcr
+import org.castberg.obsidiancapture.data.providerByName
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -97,15 +102,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         inactivityJob = null
     }
 
-    var useHighEffort by mutableStateOf(true)
+    var activeTabIndex by mutableStateOf(0)
         private set
 
-    fun toggleEffort() { useHighEffort = !useHighEffort }
+    fun onTabSelected(index: Int) { activeTabIndex = index }
 
     var isMultiMode by mutableStateOf(false)
         private set
 
     var pendingImageCount by mutableStateOf(0)
+        private set
+
+    var backgroundJobCount by mutableStateOf(0)
         private set
 
     private val _pendingImages = mutableListOf<ByteArray>()
@@ -120,27 +128,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
-            useHighEffort = settingsRepo.settings.first().defaultHighEffort
+            val s = settingsRepo.settings.first()
+            activeTabIndex = s.defaultTab.coerceIn(0, (s.tabs.size - 1).coerceAtLeast(0))
         }
     }
 
     private var lastImageBytes: ByteArray? = null
 
-    fun navigateToSettings() {
-        cancelInactivityTimer()
-        screen = Screen.Settings
-    }
-    fun navigateToCamera() {
-        saveMessage = null
-        screen = Screen.Camera
-        startInactivityTimer()
-    }
-    fun clearSaveMessage() { saveMessage = null }
+    fun navigateToSettings() { cancelInactivityTimer(); screen = Screen.Settings }
+    fun navigateToCamera()   { saveMessage = null; screen = Screen.Camera; startInactivityTimer() }
+    fun clearSaveMessage()   { saveMessage = null }
 
-    fun viewCapture(record: CaptureRecord) {
-        cancelInactivityTimer()
-        screen = Screen.ViewCapture(record)
+    fun viewCapture(record: CaptureRecord) { cancelInactivityTimer(); screen = Screen.ViewCapture(record) }
+
+    // ── Credential helpers ────────────────────────────────────────────────────
+
+    private fun resolveCredential(s: AppSettings, providerName: String): ProviderCredential =
+        s.providerCredentials.find { it.providerName == providerName }
+            ?: ProviderCredential(providerName, "")
+
+    private fun resolveBaseUrl(credential: ProviderCredential): String =
+        if (credential.providerName == "Custom") credential.customUrl
+        else providerByName(credential.providerName).baseUrl
+
+    private fun resolveFilenameCredential(s: AppSettings): ProviderCredential? {
+        val name = s.filenameProviderName.ifBlank { null }
+            ?: s.providerCredentials.firstOrNull()?.providerName
+            ?: return null
+        return resolveCredential(s, name)
     }
+
+    private fun defaultPromptForTab(tab: TabConfig) = when (tab.id) {
+        "transcribe" -> LlmClient.DEFAULT_TRANSCRIBE_PROMPT
+        "detail"     -> LlmClient.DEFAULT_ANALYSIS_PROMPT
+        else         -> LlmClient.DEFAULT_MEDIUM_ANALYSIS_PROMPT
+    }
+
+    private fun currentTab(s: AppSettings): TabConfig =
+        s.tabs.getOrElse(activeTabIndex) { s.tabs.firstOrNull() ?: DEFAULT_TABS[0] }
+
+    private fun tabAt(s: AppSettings, index: Int): TabConfig =
+        s.tabs.getOrElse(index) { s.tabs.firstOrNull() ?: DEFAULT_TABS[0] }
+
+    // ── Single capture ────────────────────────────────────────────────────────
 
     fun onImageCaptured(bytes: ByteArray) {
         cancelInactivityTimer()
@@ -150,44 +180,199 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         lastImageBytes = bytes
+        screen = Screen.Camera
+        val location = getLastKnownLocation()
+        backgroundJobCount++
+        viewModelScope.launch {
+            try {
+                val s = settings.value
+                val corrected = fixImageOrientation(bytes, s.imageQuality)
+                lastImageBytes = corrected
+
+                val (baseName, markdown, hasError) = processAndSaveSingleImage(corrected, activeTabIndex, s, location)
+
+                settingsRepo.addRecord(CaptureRecord(
+                    id        = System.currentTimeMillis().toString(),
+                    baseName  = baseName,
+                    markdown  = markdown,
+                    timestamp = System.currentTimeMillis(),
+                    folderUri = s.outputFolderUri,
+                    hasError  = hasError
+                ))
+
+                saveMessage = if (hasError) "Saved with errors: $baseName" else "Saved: $baseName"
+                startInactivityTimer()
+            } catch (e: Exception) {
+                saveMessage = "Save failed: ${e.message ?: "Unknown error"}"
+            } finally {
+                backgroundJobCount--
+            }
+        }
+    }
+
+    // ── Multi-image capture ───────────────────────────────────────────────────
+
+    fun onSendMultiImages() {
+        cancelInactivityTimer()
+        val images = _pendingImages.toList()
+        if (images.isEmpty()) return
+        _pendingImages.clear()
+        pendingImageCount = 0
+        val location = getLastKnownLocation()
+        backgroundJobCount++
+        viewModelScope.launch {
+            try {
+                val s = settings.value
+                val corrected = images.map { fixImageOrientation(it, s.imageQuality) }
+
+                val tab        = currentTab(s)
+                val credential = resolveCredential(s, tab.providerName)
+                val baseUrl    = resolveBaseUrl(credential)
+
+                var hasError = false
+                var markdown = ""
+                var ocrImages: List<Pair<String, ByteArray>> = emptyList()
+
+                try {
+                    if (isMistralOcr(tab.model)) {
+                        val parts = mutableListOf<String>()
+                        val imgs  = mutableListOf<Pair<String, ByteArray>>()
+                        corrected.forEach { bytes ->
+                            val result = LlmClient.ocrImage(baseUrl, credential.apiKey, bytes)
+                            parts.add(result.markdown)
+                            imgs.addAll(result.extractedImages)
+                        }
+                        markdown  = parts.joinToString("\n\n---\n\n")
+                        ocrImages = imgs
+                    } else {
+                        val prompt = tab.systemPrompt.ifBlank { defaultPromptForTab(tab) }
+                        markdown  = LlmClient.analyzeImages(baseUrl, credential.apiKey, corrected, tab.model, prompt, tab.maxTokens)
+                    }
+                } catch (e: Exception) {
+                    markdown = "> Analysis failed: ${e.message}"
+                    hasError = true
+                }
+
+                val filename = try { generateFilename(s, markdown) } catch (_: Exception) { "captured-${System.currentTimeMillis()}" }
+                val baseName = saveMultipleFiles(corrected, filename, markdown, s, location, ocrImages, tab.model)
+
+                settingsRepo.addRecord(CaptureRecord(
+                    id        = System.currentTimeMillis().toString(),
+                    baseName  = baseName,
+                    markdown  = markdown,
+                    timestamp = System.currentTimeMillis(),
+                    folderUri = s.outputFolderUri,
+                    hasError  = hasError
+                ))
+
+                saveMessage = if (hasError) "Saved with errors: $baseName" else "Saved: $baseName"
+                startInactivityTimer()
+            } catch (e: Exception) {
+                saveMessage = "Save failed: ${e.message ?: "Unknown error"}"
+            } finally {
+                backgroundJobCount--
+            }
+        }
+    }
+
+    // ── Resubmit ──────────────────────────────────────────────────────────────
+
+    fun resubmit(record: CaptureRecord, tabIndex: Int) {
+        cancelInactivityTimer()
         val location = getLastKnownLocation()
         viewModelScope.launch {
             runCatching {
+                val context: Context = getApplication()
                 val s = settings.value
+                screen = Screen.Processing("Loading image…")
+
+                val folder = withContext(Dispatchers.IO) {
+                    DocumentFile.fromTreeUri(context, Uri.parse(record.folderUri))
+                } ?: error("Cannot access folder")
+                val noteDir = folder.findFile("_resources")?.findFile(record.baseName)
+                    ?: error("Resources folder not found")
+                val imageFile = noteDir.findFile("image.jpg") ?: error("Image not found")
+                val bytes = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(imageFile.uri)?.use { it.readBytes() }
+                } ?: error("Cannot read image")
 
                 screen = Screen.Processing("Analyzing image…")
-                val correctedBytes = fixImageOrientation(bytes, s.imageQuality)
-                lastImageBytes = correctedBytes
+                val corrected = fixImageOrientation(bytes, s.imageQuality)
+                lastImageBytes = corrected
 
-                val model = if (useHighEffort) s.highEffortModel else s.mediumEffortModel
-                val prompt = if (useHighEffort)
-                    s.systemPrompt.ifBlank { LlmClient.DEFAULT_ANALYSIS_PROMPT }
-                else
-                    s.mediumSystemPrompt.ifBlank { LlmClient.DEFAULT_MEDIUM_ANALYSIS_PROMPT }
-                val markdown = LlmClient.analyzeImage(s, correctedBytes, model, prompt)
-
-                screen = Screen.Processing("Naming document…")
-                val filename = LlmClient.generateFilename(s, markdown)
-
-                screen = Screen.Processing("Saving…")
-                val baseName = saveFiles(correctedBytes, filename, markdown, s, location)
-
-                val record = CaptureRecord(
-                    id = System.currentTimeMillis().toString(),
-                    baseName = baseName,
-                    markdown = markdown,
-                    timestamp = System.currentTimeMillis(),
-                    folderUri = s.outputFolderUri
+                val (baseName, markdown, hasError) = processAndSaveSingleImage(
+                    corrected, tabIndex, s, location,
+                    onProgress = { step -> screen = Screen.Processing(step) }
                 )
-                settingsRepo.addRecord(record)
 
-                saveMessage = "Saved: $baseName"
+                settingsRepo.addRecord(CaptureRecord(
+                    id        = System.currentTimeMillis().toString(),
+                    baseName  = baseName,
+                    markdown  = markdown,
+                    timestamp = System.currentTimeMillis(),
+                    folderUri = s.outputFolderUri,
+                    hasError  = hasError
+                ))
+
+                saveMessage = if (hasError) "Saved with errors: $baseName" else "Saved: $baseName"
                 screen = Screen.Camera
                 startInactivityTimer()
             }.onFailure { e ->
                 screen = Screen.Error(e.message ?: "Unknown error", lastImageBytes)
             }
         }
+    }
+
+    // ── Common single-image processing ────────────────────────────────────────
+
+    private suspend fun processAndSaveSingleImage(
+        corrected: ByteArray,
+        tabIndex: Int,
+        s: AppSettings,
+        location: LocationData?,
+        onProgress: (String) -> Unit = {}
+    ): Triple<String, String, Boolean> {
+        val tab        = tabAt(s, tabIndex)
+        val credential = resolveCredential(s, tab.providerName)
+        val baseUrl    = resolveBaseUrl(credential)
+
+        var hasError = false
+        var markdown = ""
+        var ocrImages: List<Pair<String, ByteArray>> = emptyList()
+
+        try {
+            if (isMistralOcr(tab.model)) {
+                val result = LlmClient.ocrImage(baseUrl, credential.apiKey, corrected)
+                markdown  = result.markdown
+                ocrImages = result.extractedImages
+            } else {
+                val prompt = tab.systemPrompt.ifBlank { defaultPromptForTab(tab) }
+                markdown  = LlmClient.analyzeImage(baseUrl, credential.apiKey, corrected, tab.model, prompt, tab.maxTokens)
+            }
+        } catch (e: Exception) {
+            markdown = "> Analysis failed: ${e.message}"
+            hasError = true
+        }
+
+        onProgress("Naming document…")
+        val filename = try { generateFilename(s, markdown) } catch (_: Exception) { "captured-${System.currentTimeMillis()}" }
+
+        onProgress("Saving…")
+        val baseName = saveFiles(corrected, filename, markdown, s, location, ocrImages, tab.model)
+
+        return Triple(baseName, markdown, hasError)
+    }
+
+    // ── File helpers ──────────────────────────────────────────────────────────
+
+    private suspend fun generateFilename(s: AppSettings, markdown: String): String {
+        val cred = resolveFilenameCredential(s) ?: return "captured-${System.currentTimeMillis()}"
+        return LlmClient.generateFilename(
+            resolveBaseUrl(cred),
+            cred.apiKey,
+            s.filenameModel.ifBlank { "gpt-4o-mini" },
+            markdown
+        )
     }
 
     private suspend fun fixImageOrientation(bytes: ByteArray, quality: Int): ByteArray =
@@ -219,41 +404,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         parent.findFile(name) ?: parent.createDirectory(name)
             ?: error("Cannot create directory: $name")
 
-    private fun buildFrontmatter(location: LocationData?) =
-        if (location != null) buildString {
-            append("---\n")
+    private fun buildFrontmatter(location: LocationData?, model: String) = buildString {
+        append("---\n")
+        if (location != null) {
             append("latitude: ${location.latitude}\n")
             append("longitude: ${location.longitude}\n")
-            location.name?.let { append("place: \"$it\"\n") }
+            location.name?.let    { append("place: \"$it\"\n") }
             location.address?.let { append("address: \"$it\"\n") }
             append("map: \"https://www.google.com/maps?q=${location.latitude},${location.longitude}\"\n")
-            append("---\n\n")
-        } else ""
+        }
+        if (model.isNotBlank()) append("model: \"$model\"\n")
+        append("---\n\n")
+    }
 
     private suspend fun saveFiles(
         bytes: ByteArray,
         filename: String,
         markdown: String,
         settings: AppSettings,
-        locationData: LocationData?
+        locationData: LocationData?,
+        ocrImages: List<Pair<String, ByteArray>> = emptyList(),
+        model: String = ""
     ): String = withContext(Dispatchers.IO) {
         val context: Context = getApplication()
         val folder = DocumentFile.fromTreeUri(context, Uri.parse(settings.outputFolderUri))
             ?: error("Cannot access output folder")
 
-        val dateStr = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+        val dateStr  = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
         val baseName = "$dateStr-$filename"
 
         val noteFolder = getOrCreateDir(getOrCreateDir(folder, "_resources"), baseName)
+
         val imageFile = noteFolder.createFile("image/jpeg", "image.jpg")
             ?: error("Cannot create image file")
         context.contentResolver.openOutputStream(imageFile.uri)?.use { it.write(bytes) }
+
+        var processedMarkdown = markdown
+        ocrImages.forEachIndexed { index, (id, imageBytes) ->
+            val imageName = "extracted-${index + 1}.jpg"
+            noteFolder.createFile("image/jpeg", imageName)?.let { file ->
+                context.contentResolver.openOutputStream(file.uri)?.use { it.write(imageBytes) }
+            }
+            processedMarkdown = processedMarkdown.replace(
+                Regex("!\\[[^\\]]*]\\(${Regex.escape(id)}\\)"),
+                "![[_resources/$baseName/$imageName]]"
+            )
+        }
 
         val fullLocation = if (locationData != null) {
             try { reverseGeocode(locationData) } catch (_: Exception) { locationData }
         } else null
 
-        val mdContent = "${buildFrontmatter(fullLocation)}$markdown\n\n![$baseName](_resources/$baseName/image.jpg)\n"
+        val mdContent = "${buildFrontmatter(fullLocation, model)}$processedMarkdown\n\n![$baseName](_resources/$baseName/image.jpg)\n"
         val mdFile = folder.createFile("text/markdown", "$baseName.md")
             ?: error("Cannot create markdown file")
         context.contentResolver.openOutputStream(mdFile.uri)?.use { it.write(mdContent.toByteArray()) }
@@ -261,12 +463,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         baseName
     }
 
+    private suspend fun saveMultipleFiles(
+        imagesList: List<ByteArray>,
+        filename: String,
+        markdown: String,
+        settings: AppSettings,
+        locationData: LocationData?,
+        ocrImages: List<Pair<String, ByteArray>> = emptyList(),
+        model: String = ""
+    ): String = withContext(Dispatchers.IO) {
+        val context: Context = getApplication()
+        val folder = DocumentFile.fromTreeUri(context, Uri.parse(settings.outputFolderUri))
+            ?: error("Cannot access output folder")
+
+        val dateStr  = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+        val baseName = "$dateStr-$filename"
+
+        val noteFolder = getOrCreateDir(getOrCreateDir(folder, "_resources"), baseName)
+
+        val imageRefs = StringBuilder()
+        imagesList.forEachIndexed { index, imgBytes ->
+            val imageName = "image-${index + 1}.jpg"
+            noteFolder.createFile("image/jpeg", imageName)?.let { file ->
+                context.contentResolver.openOutputStream(file.uri)?.use { it.write(imgBytes) }
+            }
+            imageRefs.append("![$baseName-${index + 1}](_resources/$baseName/$imageName)\n")
+        }
+
+        var processedMarkdown = markdown
+        ocrImages.forEachIndexed { index, (id, imageBytes) ->
+            val imageName = "extracted-${index + 1}.jpg"
+            noteFolder.createFile("image/jpeg", imageName)?.let { file ->
+                context.contentResolver.openOutputStream(file.uri)?.use { it.write(imageBytes) }
+            }
+            processedMarkdown = processedMarkdown.replace(
+                Regex("!\\[[^\\]]*]\\(${Regex.escape(id)}\\)"),
+                "![[_resources/$baseName/$imageName]]"
+            )
+        }
+
+        val fullLocation = if (locationData != null) {
+            try { reverseGeocode(locationData) } catch (_: Exception) { locationData }
+        } else null
+
+        val mdContent = "${buildFrontmatter(fullLocation, model)}$processedMarkdown\n\n$imageRefs"
+        val mdFile = folder.createFile("text/markdown", "$baseName.md")
+            ?: error("Cannot create markdown file")
+        context.contentResolver.openOutputStream(mdFile.uri)?.use { it.write(mdContent.toByteArray()) }
+
+        baseName
+    }
+
+    // ── Location ──────────────────────────────────────────────────────────────
+
     @SuppressLint("MissingPermission")
     private fun getLastKnownLocation(): LocationData? {
         val context: Context = getApplication()
-        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            return null
-        }
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED) return null
         val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
         val loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
             ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
@@ -291,9 +545,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val addr = json.optJSONObject("address")
         val address = addr?.let {
             listOfNotNull(
-                it.optString("road").takeIf { s -> s.isNotBlank() },
-                (it.optString("city").takeIf { s -> s.isNotBlank() }
-                    ?: it.optString("town").takeIf { s -> s.isNotBlank() }
+                it.optString("road").takeIf    { s -> s.isNotBlank() },
+                (it.optString("city").takeIf   { s -> s.isNotBlank() }
+                    ?: it.optString("town").takeIf    { s -> s.isNotBlank() }
                     ?: it.optString("village").takeIf { s -> s.isNotBlank() }),
                 it.optString("country").takeIf { s -> s.isNotBlank() }
             ).joinToString(", ").takeIf { s -> s.isNotBlank() }
@@ -302,96 +556,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         location.copy(name = name, address = address)
     }
 
-    fun onSendMultiImages() {
-        cancelInactivityTimer()
-        val images = _pendingImages.toList()
-        if (images.isEmpty()) return
-        _pendingImages.clear()
-        pendingImageCount = 0
-        val location = getLastKnownLocation()
-        viewModelScope.launch {
-            runCatching {
-                val s = settings.value
-                screen = Screen.Processing("Analyzing ${images.size} images…")
-                val correctedImages = images.map { fixImageOrientation(it, s.imageQuality) }
+    // ── Navigation helpers ────────────────────────────────────────────────────
 
-                val model = if (useHighEffort) s.highEffortModel else s.mediumEffortModel
-                val prompt = if (useHighEffort)
-                    s.systemPrompt.ifBlank { LlmClient.DEFAULT_ANALYSIS_PROMPT }
-                else
-                    s.mediumSystemPrompt.ifBlank { LlmClient.DEFAULT_MEDIUM_ANALYSIS_PROMPT }
-
-                val markdown = LlmClient.analyzeImages(s, correctedImages, model, prompt)
-
-                screen = Screen.Processing("Naming document…")
-                val filename = LlmClient.generateFilename(s, markdown)
-
-                screen = Screen.Processing("Saving…")
-                val baseName = saveMultipleFiles(correctedImages, filename, markdown, s, location)
-
-                val record = CaptureRecord(
-                    id = System.currentTimeMillis().toString(),
-                    baseName = baseName,
-                    markdown = markdown,
-                    timestamp = System.currentTimeMillis(),
-                    folderUri = s.outputFolderUri
-                )
-                settingsRepo.addRecord(record)
-
-                saveMessage = "Saved: $baseName"
-                screen = Screen.Camera
-                startInactivityTimer()
-            }.onFailure { e ->
-                screen = Screen.Error(e.message ?: "Unknown error", null)
-            }
-        }
-    }
-
-    private suspend fun saveMultipleFiles(
-        imagesList: List<ByteArray>,
-        filename: String,
-        markdown: String,
-        settings: AppSettings,
-        locationData: LocationData?
-    ): String = withContext(Dispatchers.IO) {
-        val context: Context = getApplication()
-        val folder = DocumentFile.fromTreeUri(context, Uri.parse(settings.outputFolderUri))
-            ?: error("Cannot access output folder")
-
-        val dateStr = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
-        val baseName = "$dateStr-$filename"
-
-        val noteFolder = getOrCreateDir(getOrCreateDir(folder, "_resources"), baseName)
-        val imageRefs = StringBuilder()
-        imagesList.forEachIndexed { index, bytes ->
-            val imageName = "image-${index + 1}.jpg"
-            val imageFile = noteFolder.createFile("image/jpeg", imageName)
-                ?: error("Cannot create image file $imageName")
-            context.contentResolver.openOutputStream(imageFile.uri)?.use { it.write(bytes) }
-            imageRefs.append("![$baseName-${index + 1}](_resources/$baseName/$imageName)\n")
-        }
-
-        val fullLocation = if (locationData != null) {
-            try { reverseGeocode(locationData) } catch (_: Exception) { locationData }
-        } else null
-
-        val mdContent = "${buildFrontmatter(fullLocation)}$markdown\n\n$imageRefs"
-        val mdFile = folder.createFile("text/markdown", "$baseName.md")
-            ?: error("Cannot create markdown file")
-        context.contentResolver.openOutputStream(mdFile.uri)?.use { it.write(mdContent.toByteArray()) }
-
-        baseName
-    }
-
-    fun retry() {
-        val bytes = lastImageBytes ?: return
-        onImageCaptured(bytes)
-    }
-
-    fun retake() {
-        screen = Screen.Camera
-        startInactivityTimer()
-    }
+    fun retry()  { lastImageBytes?.let { onImageCaptured(it) } }
+    fun retake() { screen = Screen.Camera; startInactivityTimer() }
 
     fun saveSettings(new: AppSettings) {
         viewModelScope.launch { settingsRepo.save(new) }

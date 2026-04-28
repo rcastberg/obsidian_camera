@@ -4,6 +4,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -52,6 +54,9 @@ fun HistorySheet(
                                 style = MaterialTheme.typography.bodySmall
                             )
                         },
+                        trailingContent = if (record.hasError) {
+                            { Icon(Icons.Default.Warning, contentDescription = "Analysis failed", tint = MaterialTheme.colorScheme.error) }
+                        } else null,
                         modifier = Modifier.clickable { onSelect(record) }
                     )
                     HorizontalDivider()
